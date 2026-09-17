@@ -1,14 +1,15 @@
 """
-05_transfer_learning.py — SignPAK-AI (Optimized Pose-TGCN Transfer Engine)
-============================================================================
-Optimized Transfer Strategy:
+05_transfer_learning_include.py — SignPAK-AI (Optimized INCLUDE / ISL Transfer Engine)
+======================================================================================
+Optimized Transfer Learning Architecture:
   - Loads Clean AND Offline Augmented samples safely (data/csv/).
   - Strict GroupKFold (N_SPLITS=6) for Leave-One-Signer-Out Cross-Validation.
   - Evaluation Integrity: Validates exclusively on CLEAN samples of holdout signers.
-  - Exact tensor matching against 'models/tgcn_wlasl_pretrained.pth'.
+  - Automatically unwraps nested checkpoint dictionaries (ckpt['model']).
+  - Maps 32-40 pretrained BiLSTM weight tensors from ISL backbone.
   - Real-Time Skeleton Warping: Limb scaling + 3D rotation + coordinate noise.
 
-Run from: SIGNPAK-AI root → python scripts/05_transfer_learning.py
+Run from: SIGNPAK-AI root → python scripts/05_transfer_learning_include.py
 """
 
 import os
@@ -27,16 +28,18 @@ _THIS        = Path(__file__).resolve()
 PROJECT_ROOT = _THIS.parent.parent
 DATA_DIR     = PROJECT_ROOT / "data"
 CSV_V2_DIR   = DATA_DIR / "csv"  # Fixed path to load full augmented dataset
-CKPT_DIR     = PROJECT_ROOT / "models" / "checkpoints_transfer"
+CKPT_DIR     = PROJECT_ROOT / "models" / "checkpoints_include"
 CKPT_DIR.mkdir(parents=True, exist_ok=True)
-WEIGHTS_PATH = PROJECT_ROOT / "models" / "tgcn_wlasl_pretrained.pth"
+WEIGHTS_PATH = PROJECT_ROOT / "models" / "checkpoints" / "include_pretrained.pth"
 
-MAX_SEQ_LEN   = 60
-FEATURE_DIM   = 726
-BATCH_SIZE    = 16
-EPOCHS        = 70
-N_SPLITS      = 6  # True Leave-One-Signer-Out CV
-LEARNING_RATE = 5e-4
+MAX_SEQ_LEN     = 60
+FEATURE_DIM     = 726
+INCLUDE_IN_DIM  = 134
+BATCH_SIZE      = 16
+EPOCHS          = 70
+WARMUP_EPOCHS   = 10
+N_SPLITS        = 6  # True Leave-One-Signer-Out CV
+LEARNING_RATE   = 8e-4
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -55,65 +58,47 @@ DIST_PAIRS = [
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 1. Pose-TGCN Architecture
+# 1. Architecture Matching INCLUDE Checkpoint
 # ═════════════════════════════════════════════════════════════════════════════
 
-class GraphConvolutionLayer(nn.Module):
-    def __init__(self, in_features: int, out_features: int, num_nodes: int = 55):
+class TemporalAttention(nn.Module):
+    def __init__(self, hidden_dim: int):
         super().__init__()
-        self.weight = nn.Parameter(torch.FloatTensor(in_features, out_features))
-        self.att = nn.Parameter(torch.FloatTensor(num_nodes, num_nodes))
-        self.bias = nn.Parameter(torch.FloatTensor(out_features))
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        nn.init.kaiming_uniform_(self.weight)
-        nn.init.uniform_(self.att, a=-0.05, b=0.05)
-        nn.init.zeros_(self.bias)
+        self.attn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Tanh(),
+            nn.Linear(hidden_dim // 2, 1)
+        )
 
     def forward(self, x):
-        out = torch.matmul(self.att, x)
-        out = torch.matmul(out, self.weight) + self.bias
-        return out
+        weights = torch.softmax(self.attn(x), dim=1)
+        return torch.sum(x * weights, dim=1)
 
 
-class GCBBlock(nn.Module):
-    def __init__(self, in_channels: int = 256, out_channels: int = 256):
-        super().__init__()
-        self.gc1 = GraphConvolutionLayer(in_channels, out_channels)
-        self.bn1 = nn.BatchNorm1d(out_channels)
-
-    def forward(self, x):
-        out = self.gc1(x)
-        B, T, V, C = out.shape
-        out_flat = out.view(B * T * V, C)
-        out_bn = self.bn1(out_flat).view(B, T, V, C)
-        return torch.relu(out_bn)
-
-
-class PoseTGCNTransferModelOpt(nn.Module):
+class ExactIncludeModelOpt(nn.Module):
     def __init__(self, in_features: int = FEATURE_DIM, num_classes: int = 37):
         super().__init__()
-        self.stem_adaptor = nn.Sequential(
-            nn.Linear(in_features, 55 * 100),
-            nn.ReLU()
+        # Stem adapter: 726 -> 134
+        self.adapter = nn.Sequential(
+            nn.Linear(in_features, 256),
+            nn.BatchNorm1d(MAX_SEQ_LEN),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(256, INCLUDE_IN_DIM)
         )
 
-        self.gc1 = GraphConvolutionLayer(100, 256)
-        self.bn1 = nn.BatchNorm1d(256)
-        self.gcbs = nn.ModuleList([GCBBlock(256, 256) for _ in range(4)])
-
+        # 5-Layer Stacked BiLSTM Backbone
         self.lstm = nn.LSTM(
-            input_size=256, hidden_size=256, num_layers=2,
-            batch_first=True, bidirectional=True, dropout=0.5
+            input_size=INCLUDE_IN_DIM,
+            hidden_size=256,
+            num_layers=5,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.5
         )
-        
-        self.attn = nn.Sequential(
-            nn.Linear(512, 128),
-            nn.Tanh(),
-            nn.Linear(128, 1)
-        )
-        
+
+        # Task-Specific Head for PSL
+        self.attn = TemporalAttention(512)
         self.classifier = nn.Sequential(
             nn.Dropout(0.6),
             nn.Linear(512, 256),
@@ -129,57 +114,49 @@ class PoseTGCNTransferModelOpt(nn.Module):
             return False
 
         try:
-            checkpoint = torch.load(weights_path, map_location="cpu", weights_only=False)
-            if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-                ckpt_dict = checkpoint["state_dict"]
-            elif isinstance(checkpoint, dict):
-                ckpt_dict = checkpoint
-            else:
-                ckpt_dict = getattr(checkpoint, "state_dict", lambda: {})()
+            ckpt = torch.load(weights_path, map_location="cpu", weights_only=False)
+
+            if isinstance(ckpt, dict) and "model" in ckpt:
+                ckpt = ckpt["model"]
+            elif isinstance(ckpt, dict) and "state_dict" in ckpt:
+                ckpt = ckpt["state_dict"]
 
             model_dict = self.state_dict()
             transferred_dict = {}
 
-            for k, v in ckpt_dict.items():
+            for k, v in ckpt.items():
+                if not isinstance(v, torch.Tensor) or "l1" in k:
+                    continue
+
                 if k in model_dict and model_dict[k].shape == v.shape:
                     transferred_dict[k] = v
+                else:
+                    clean_k = k if k.startswith("lstm.") else f"lstm.{k}"
+                    if clean_k in model_dict and model_dict[clean_k].shape == v.shape:
+                        transferred_dict[clean_k] = v
 
             model_dict.update(transferred_dict)
             self.load_state_dict(model_dict)
-            print(f"✅ Successfully transferred {len(transferred_dict)} / {len(ckpt_dict)} pretrained weight tensors!")
+            print(f"✅ REAL TRANSFER SUCCESS: Loaded {len(transferred_dict)} / {len(ckpt)} INCLUDE pretrained tensors!")
             return len(transferred_dict) > 0
         except Exception as e:
             print(f"⚠️ Error loading weights: {e}")
             return False
 
-    def freeze_pretrained_backbone(self):
-        for param in self.gc1.parameters():
+    def freeze_backbone(self):
+        for param in self.lstm.parameters():
             param.requires_grad = False
-        for param in self.bn1.parameters():
-            param.requires_grad = False
-        for block in self.gcbs:
-            for param in block.parameters():
-                param.requires_grad = False
-        print("🔒 Pose-TGCN Graph Backbone layers FROZEN for Transfer Learning.")
+        print("🔒 INCLUDE BiLSTM Backbone layers FROZEN for Warmup Stage.")
+
+    def unfreeze_backbone(self):
+        for param in self.lstm.parameters():
+            param.requires_grad = True
+        print("🔓 INCLUDE BiLSTM Backbone layers UNFROZEN for Fine-Tuning.")
 
     def forward(self, x):
-        B, T, _ = x.shape
-        x_proj = self.stem_adaptor(x).view(B, T, 55, 100)
-
-        g1 = self.gc1(x_proj)
-        g1_flat = g1.view(B * T * 55, 256)
-        g1_bn = torch.relu(self.bn1(g1_flat)).view(B, T, 55, 256)
-
-        out_g = g1_bn
-        for block in self.gcbs:
-            out_g = block(out_g)
-
-        seq_feat = out_g.mean(dim=2)
-
-        out_lstm, _ = self.lstm(seq_feat)
-        weights = torch.softmax(self.attn(out_lstm), dim=1)
-        context = torch.sum(out_lstm * weights, dim=1)
-
+        x_proj = self.adapter(x)        # (B, T, 134)
+        out_lstm, _ = self.lstm(x_proj) # (B, T, 512)
+        context = self.attn(out_lstm)   # (B, 512)
         logits = self.classifier(context)
         return logits
 
@@ -286,8 +263,8 @@ class FastTransferDataset(Dataset):
 # 3. Execution Pipeline
 # ═════════════════════════════════════════════════════════════════════════════
 
-def run_transfer_learning():
-    print(f"🚀 Optimized Pretrained TGCN Transfer Device: {DEVICE} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
+def run_include_transfer():
+    print(f"🚀 Optimized INCLUDE Transfer Engine Running on Device: {DEVICE} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
 
     all_samples = []
     all_label_strs = set()
@@ -333,7 +310,7 @@ def run_transfer_learning():
     num_workers = 2 if os.name == "nt" else 4
 
     for fold, (train_idx, val_idx) in enumerate(gkf.split(X, y, groups), 1):
-        print(f"\n{'='*60}\n 🔄 RUNNING PRETRAINED TGCN TRANSFER FOLD {fold}/{n_folds} (GroupKFold)\n{'='*60}")
+        print(f"\n{'='*60}\n 🔄 RUNNING INCLUDE TRANSFER FOLD {fold}/{n_folds} (GroupKFold)\n{'='*60}")
 
         train_samples = X[train_idx].tolist()
         val_samples_all = X[val_idx].tolist()
@@ -353,11 +330,11 @@ def run_transfer_learning():
             batch_size=BATCH_SIZE, shuffle=False, num_workers=num_workers, pin_memory=True
         )
 
-        model = PoseTGCNTransferModelOpt(in_features=FEATURE_DIM, num_classes=num_classes).to(DEVICE)
+        model = ExactIncludeModelOpt(in_features=FEATURE_DIM, num_classes=num_classes).to(DEVICE)
         
         loaded = model.load_pretrained_weights(WEIGHTS_PATH)
         if loaded:
-            model.freeze_pretrained_backbone()
+            model.freeze_backbone()
 
         criterion = nn.CrossEntropyLoss(label_smoothing=0.20)
         optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LEARNING_RATE, weight_decay=3e-2)
@@ -366,9 +343,22 @@ def run_transfer_learning():
         scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=LEARNING_RATE, total_steps=total_steps, pct_start=0.2)
 
         best_val_acc = 0.0
-        fold_save_path = CKPT_DIR / f"best_transfer_model_fold{fold}.pth"
+        fold_save_path = CKPT_DIR / f"best_include_model_fold{fold}.pth"
 
         for epoch in range(1, EPOCHS + 1):
+            if epoch == WARMUP_EPOCHS + 1 and loaded:
+                model.unfreeze_backbone()
+                optimizer = optim.AdamW([
+                    {'params': model.adapter.parameters(),    'lr': LEARNING_RATE},
+                    {'params': model.lstm.parameters(),       'lr': LEARNING_RATE * 0.15},
+                    {'params': model.attn.parameters(),       'lr': LEARNING_RATE},
+                    {'params': model.classifier.parameters(), 'lr': LEARNING_RATE},
+                ], weight_decay=3e-2)
+                scheduler = optim.lr_scheduler.OneCycleLR(
+                    optimizer, max_lr=[LEARNING_RATE, LEARNING_RATE * 0.15, LEARNING_RATE, LEARNING_RATE],
+                    total_steps=(EPOCHS - WARMUP_EPOCHS) * len(train_loader), pct_start=0.15
+                )
+
             model.train()
             train_loss, train_correct, total_train = 0.0, 0, 0
 
@@ -410,18 +400,19 @@ def run_transfer_learning():
                 torch.save(model.state_dict(), fold_save_path)
 
             if epoch % 10 == 0 or epoch == EPOCHS:
-                print(f"Fold {fold} | Epoch [{epoch:02d}/{EPOCHS}] - Train Acc: {train_acc*100:.2f}% | Val Acc: {val_acc*100:.2f}% (Best: {best_val_acc*100:.2f}%)")
+                stage_str = "Warmup" if (epoch <= WARMUP_EPOCHS and loaded) else "FineTune"
+                print(f"[{stage_str}] Fold {fold} | Epoch [{epoch:02d}/{EPOCHS}] - Train Acc: {train_acc*100:.2f}% | Val Acc: {val_acc*100:.2f}% (Best: {best_val_acc*100:.2f}%)")
 
         fold_accuracies.append(best_val_acc)
         print(f"✅ Fold {fold} Complete. Best Accuracy: {best_val_acc*100:.2f}%")
 
     print("\n" + "=" * 60)
-    print(" 📊 PRETRAINED TRANSFER LEARNING SUMMARY")
+    print(" 📊 INCLUDE PRETRAINED TRANSFER SUMMARY")
     print("=" * 60)
     for f_idx, acc in enumerate(fold_accuracies, 1):
         print(f"  Fold {f_idx}: {acc*100:.2f}%")
-    print(f"\n  ⭐ Mean Pretrained Accuracy: {np.mean(fold_accuracies)*100:.2f}% ± {np.std(fold_accuracies)*100:.2f}%")
+    print(f"\n  ⭐ Mean Out-of-Sample Accuracy: {np.mean(fold_accuracies)*100:.2f}% ± {np.std(fold_accuracies)*100:.2f}%")
     print("=" * 60)
 
 if __name__ == "__main__":
-    run_transfer_learning()
+    run_include_transfer()

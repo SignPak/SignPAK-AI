@@ -1,17 +1,14 @@
 """
-03_crop_signers.py  —  SignPAK-AI
-===================================
-Crops the signer out of processed videos using MediaPipe Pose Tasks API
-to build a bounding box around the upper body and normalize resolution to 256x256.
+03_crop_signers.py — SignPAK-AI (Dynamic Scale Bounding Box Engine)
+===================================================================
+- Dynamically crops all Signer directories in data/processed/.
+- Crops upper-body bounding boxes to 256x256 resolution.
+- Auto-skips previously cropped videos in data/cropped/.
 
 Input  : data/processed/**/*.mp4
 Output : data/cropped/**/*.mp4
-
-Place in:  scripts/03_crop_signers.py
-Run from:  SIGNPAK-AI root  →  python scripts/03_crop_signers.py
 """
 
-import re
 import cv2
 import json
 import urllib.request
@@ -23,30 +20,25 @@ from collections import defaultdict
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
-_THIS        = Path(__file__).resolve()
+_THIS = Path(__file__).resolve()
 PROJECT_ROOT = _THIS.parent.parent
-DATA_DIR     = PROJECT_ROOT / "data"
-IN_DIR       = DATA_DIR / "processed"
-OUT_DIR      = DATA_DIR / "cropped"
-LOG_DIR      = DATA_DIR / "logs"
-MODEL_DIR    = PROJECT_ROOT / "models"
-MODEL_PATH   = MODEL_DIR / "pose_landmarker.task"
+DATA_DIR = PROJECT_ROOT / "data"
+IN_DIR = DATA_DIR / "processed"
+OUT_DIR = DATA_DIR / "cropped"
+LOG_DIR = DATA_DIR / "logs"
+MODEL_DIR = PROJECT_ROOT / "models"
+MODEL_PATH = MODEL_DIR / "pose_landmarker.task"
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-# Pose Task Model CDN Link (MediaPipe Official)
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task"
 
-# ── Crop Parameters ───────────────────────────────────────────────────────────
-OUTPUT_SIZE   = (256, 256)   # Final frame resolution
-PADDING_FRAC  = 0.20         # 20% padding around bounding box
-
-# Upper body landmark indices in MediaPipe Pose
+OUTPUT_SIZE = (256, 256)
+PADDING_FRAC = 0.20
 UPPER_BODY_LM = [0, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
 
-# ── Ensure Model File Exists ──────────────────────────────────────────────────
+
 def ensure_model_exists():
     if not MODEL_PATH.exists():
         print(f"📦 Downloading pose_landmarker model to {MODEL_PATH} ...")
@@ -55,10 +47,9 @@ def ensure_model_exists():
 
 ensure_model_exists()
 
-# ── Setup MediaPipe Pose Tasks API (CPU Delegate) ───────────────────────────
 base_options = python.BaseOptions(
     model_asset_path=str(MODEL_PATH),
-    delegate=python.BaseOptions.Delegate.CPU  # CPU delegate fixed for Windows pip builds
+    delegate=python.BaseOptions.Delegate.CPU
 )
 options = vision.PoseLandmarkerOptions(
     base_options=base_options,
@@ -138,7 +129,6 @@ def crop_video(in_path: Path, out_path: Path) -> dict:
         cap.release()
         return {"status": "invalid_or_corrupt_video", "bbox_median": None}
 
-    # Step 1: sample ~10 frames to compute a stable bounding box
     sample_indices = np.linspace(0, total_frames - 1, min(10, total_frames), dtype=int).tolist()
     bboxes = []
 
@@ -157,7 +147,6 @@ def crop_video(in_path: Path, out_path: Path) -> dict:
 
     x1, y1, x2, y2 = median_bbox(bboxes)
 
-    # Step 2: Crop and resize video
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -196,7 +185,7 @@ def process_all() -> None:
         print("   Run 02_segment_videos.py first.")
         return
 
-    print(f"Found {len(all_videos)} processed videos to crop.\n")
+    print(f"Found {len(all_videos)} processed videos across ALL signers to crop.\n")
 
     log_entries = []
     stats = defaultdict(int)
@@ -204,6 +193,11 @@ def process_all() -> None:
     for mp4 in all_videos:
         rel = mp4.relative_to(IN_DIR)
         out = OUT_DIR / rel
+
+        if out.exists() and out.stat().st_size > 1000:
+            print(f"  ⏩ {rel} (Already cropped, skipping)")
+            stats["ok"] += 1
+            continue
 
         print(f"  {rel} ...", end=" ", flush=True)
 
@@ -235,11 +229,10 @@ def process_all() -> None:
     print("\n" + "=" * 60)
     print("  CROP SUMMARY")
     print("=" * 60)
-    print(f"  ✅ Cropped      : {stats['ok']}")
-    print(f"  ⚠️  Resize only  : {stats['fallback']}")
-    print(f"  ❌ Errors       : {stats['error']}")
-    print(f"  Output dir       : {OUT_DIR}")
-    print(f"  Log              : {log_path}")
+    print(f"   Cropped      : {stats['ok']}")
+    print(f"   Resize only  : {stats['fallback']}")
+    print(f"   Errors       : {stats['error']}")
+    print(f"   Output dir   : {OUT_DIR}")
     print("=" * 60)
 
 
